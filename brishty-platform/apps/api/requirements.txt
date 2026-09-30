@@ -7,5 +7,6 @@ celery
 redis
 python-multipart
 boto3
+opencv-python-headless
 docling
 openai
