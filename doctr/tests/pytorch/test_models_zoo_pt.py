@@ -1,0 +1,791 @@
+import numpy as np
+import pytest
+import torch
+from torch import nn
+
+from doctr import models
+from doctr.file_utils import CLASS_NAME
+from doctr.io import Document, DocumentFile
+from doctr.io.elements import KIEDocument, LayoutElement, Table
+from doctr.models import detection, layout, recognition
+from doctr.models.classification import mobilenet_v3_small_crop_orientation, mobilenet_v3_small_page_orientation
+from doctr.models.classification.zoo import crop_orientation_predictor, page_orientation_predictor
+from doctr.models.detection.predictor import DetectionPredictor
+from doctr.models.detection.zoo import detection_predictor
+from doctr.models.kie_predictor import KIEPredictor
+from doctr.models.layout.predictor import LayoutPredictor
+from doctr.models.layout.zoo import layout_predictor
+from doctr.models.predictor import OCRPredictor
+from doctr.models.preprocessor import PreProcessor
+from doctr.models.recognition.predictor import RecognitionPredictor
+from doctr.models.recognition.zoo import recognition_predictor
+from doctr.models.table_structure.predictor import TablePredictor
+from doctr.models.table_structure.zoo import table_predictor
+
+
+# Create a dummy callback
+class _DummyCallback:
+    def __call__(self, loc_preds):
+        return loc_preds
+
+
+@pytest.mark.parametrize(
+    "assume_straight_pages, straighten_pages, disable_page_orientation, disable_crop_orientation",
+    [
+        [True, False, False, False],
+        [False, False, True, True],
+        [True, True, False, False],
+        [False, True, True, True],
+        [True, False, True, False],
+    ],
+)
+def test_ocrpredictor(
+    mock_pdf, mock_vocab, assume_straight_pages, straighten_pages, disable_page_orientation, disable_crop_orientation
+):
+    det_bsize = 4
+    det_predictor = DetectionPredictor(
+        PreProcessor(output_size=(512, 512), batch_size=det_bsize),
+        detection.db_mobilenet_v3_large(
+            pretrained=False,
+            pretrained_backbone=False,
+            assume_straight_pages=assume_straight_pages,
+        ),
+    )
+
+    assert not det_predictor.model.training
+
+    reco_bsize = 32
+    reco_predictor = RecognitionPredictor(
+        PreProcessor(output_size=(32, 128), batch_size=reco_bsize, preserve_aspect_ratio=True),
+        recognition.crnn_vgg16_bn(pretrained=False, pretrained_backbone=False, vocab=mock_vocab),
+    )
+
+    assert not reco_predictor.model.training
+
+    doc = DocumentFile.from_pdf(mock_pdf)
+
+    predictor = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=assume_straight_pages,
+        straighten_pages=straighten_pages,
+        detect_orientation=True,
+        detect_language=True,
+        resolve_blocks=True,
+        resolve_lines=True,
+        disable_page_orientation=disable_page_orientation,
+        disable_crop_orientation=disable_crop_orientation,
+    )
+
+    assert (
+        predictor._page_orientation_disabled if disable_page_orientation else not predictor._page_orientation_disabled
+    )
+    assert (
+        predictor._crop_orientation_disabled if disable_crop_orientation else not predictor._crop_orientation_disabled
+    )
+
+    if assume_straight_pages:
+        assert predictor.crop_orientation_predictor is None
+        if predictor.detect_orientation or predictor.straighten_pages:
+            assert isinstance(predictor.page_orientation_predictor, nn.Module)
+        else:
+            assert predictor.page_orientation_predictor is None
+    else:
+        assert isinstance(predictor.crop_orientation_predictor, nn.Module)
+        assert isinstance(predictor.page_orientation_predictor, nn.Module)
+
+    out = predictor(doc)
+    assert isinstance(out, Document)
+    assert len(out.pages) == 2
+    # Dimension check
+    with pytest.raises(ValueError):
+        input_page = (255 * np.random.rand(1, 256, 512, 3)).astype(np.uint8)
+        _ = predictor([input_page])
+
+    orientation = 0
+    assert out.pages[0].orientation["value"] == orientation
+
+    # Test with custom orientation models
+    custom_crop_orientation_model = mobilenet_v3_small_crop_orientation(pretrained=True)
+    custom_page_orientation_model = mobilenet_v3_small_page_orientation(pretrained=True)
+
+    if assume_straight_pages:
+        if predictor.detect_orientation or predictor.straighten_pages:
+            # Overwrite the default orientation models
+            predictor.crop_orientation_predictor = crop_orientation_predictor(custom_crop_orientation_model)
+            predictor.page_orientation_predictor = page_orientation_predictor(custom_page_orientation_model)
+    else:
+        # Overwrite the default orientation models
+        predictor.crop_orientation_predictor = crop_orientation_predictor(custom_crop_orientation_model)
+        predictor.page_orientation_predictor = page_orientation_predictor(custom_page_orientation_model)
+
+    out = predictor(doc)
+    orientation = 0
+    assert out.pages[0].orientation["value"] == orientation
+
+
+def test_predictors_on_empty_batch(mock_vocab):
+    det_predictor = DetectionPredictor(
+        PreProcessor(output_size=(512, 512), batch_size=2),
+        detection.db_mobilenet_v3_large(pretrained=False, pretrained_backbone=False, assume_straight_pages=True),
+    )
+    reco_predictor = RecognitionPredictor(
+        PreProcessor(output_size=(32, 128), batch_size=32, preserve_aspect_ratio=True),
+        recognition.crnn_vgg16_bn(pretrained=False, pretrained_backbone=False, vocab=mock_vocab),
+    )
+
+    # Detection keeps the shape its `return_maps` contract promises.
+    assert det_predictor([]) == []
+    assert det_predictor([], return_maps=True) == ([], [])
+
+    # The recognition predictor already behaved; asserted here so the three
+    # stay consistent if one of them is touched again.
+    assert reco_predictor([]) == []
+
+    for predictor, expected_type in (
+        (OCRPredictor(det_predictor, reco_predictor, assume_straight_pages=True), Document),
+        (KIEPredictor(det_predictor, reco_predictor, assume_straight_pages=True), KIEDocument),
+    ):
+        out = predictor([])
+        # Exact type, not isinstance: KIEDocument subclasses Document, so an
+        # isinstance check would not notice the KIE path degrading to the base
+        # class and dropping the per-class prediction shape.
+        assert type(out) is expected_type
+        assert out.pages == []
+        assert out.export() == {"pages": []}
+
+
+def test_ocrpredictor_layout(mock_pdf, mock_vocab, mock_payslip):
+    det_predictor = DetectionPredictor(
+        PreProcessor(output_size=(512, 512), batch_size=2),
+        detection.db_mobilenet_v3_large(pretrained=False, pretrained_backbone=False, assume_straight_pages=True),
+    )
+    reco_predictor = RecognitionPredictor(
+        PreProcessor(output_size=(32, 128), batch_size=32, preserve_aspect_ratio=True),
+        recognition.crnn_vgg16_bn(pretrained=False, pretrained_backbone=False, vocab=mock_vocab),
+    )
+    layout_pred = layout_predictor("lw_detr_s", pretrained=False)
+
+    doc = DocumentFile.from_pdf(mock_pdf)
+
+    # Without a layout predictor -> pages carry an empty layout
+    predictor = OCRPredictor(det_predictor, reco_predictor, ignore_regions=["Picture", "Formula"])
+    assert predictor.layout_predictor is None
+    out = predictor(doc)
+    assert all(page.layout == [] for page in out.pages)
+    assert all(page.export()["layout"] == [] for page in out.pages)
+
+    # With a layout predictor -> detected regions are attached to every page
+    predictor = OCRPredictor(
+        det_predictor, reco_predictor, layout_predictor=layout_pred, ignore_regions=["Picture", "Formula"]
+    )
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    out = predictor(doc)
+    assert isinstance(out, Document)
+    for page in out.pages:
+        assert isinstance(page.layout, list)
+        assert all(isinstance(region, LayoutElement) for region in page.layout)
+        # the layout is exported alongside the page
+        exported = page.export()
+        assert "layout" in exported
+        assert exported["layout"] == [region.export() for region in page.layout]
+
+    doc = DocumentFile.from_images(mock_payslip)
+
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=True,
+        symmetric_pad=True,
+        preserve_aspect_ratio=False,
+    )
+    reco_predictor = recognition_predictor("crnn_vgg16_bn", pretrained=True, batch_size=128)
+
+    predictor = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=True,
+        straighten_pages=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+    )
+
+    out = predictor(doc)
+
+    assert out.pages[0].blocks[0].lines[0].words[0].value == "Mr."
+    geometry_mr = np.array([[0.1083984375, 0.0634765625], [0.1494140625, 0.0859375]])
+    assert np.allclose(np.array(out.pages[0].blocks[0].lines[0].words[0].geometry), geometry_mr, rtol=0.05)
+
+    assert out.pages[0].blocks[1].lines[0].words[-1].value == "revised"
+    geometry_revised = np.array([[0.7548828125, 0.126953125], [0.8388671875, 0.1484375]])
+    assert np.allclose(np.array(out.pages[0].blocks[1].lines[0].words[-1].geometry), geometry_revised, rtol=0.05)
+
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=True,
+        preserve_aspect_ratio=True,
+        symmetric_pad=True,
+    )
+
+    predictor = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=True,
+        straighten_pages=True,
+        preserve_aspect_ratio=True,
+        symmetric_pad=True,
+        resolve_blocks=True,
+        resolve_lines=True,
+        ignore_regions=["Picture", "Formula"],
+    )
+    # test hooks
+    predictor.add_hook(_DummyCallback())
+
+    out = predictor(doc)
+
+    assert out.pages[0].blocks[0].lines[0].words[0].value == "Mr."
+
+
+def test_ocrpredictor_tables(mock_pdf, mock_vocab):
+    det_predictor = DetectionPredictor(
+        PreProcessor(output_size=(512, 512), batch_size=2),
+        detection.db_mobilenet_v3_large(pretrained=False, pretrained_backbone=False, assume_straight_pages=True),
+    )
+    reco_predictor = RecognitionPredictor(
+        PreProcessor(output_size=(32, 128), batch_size=32, preserve_aspect_ratio=True),
+        recognition.crnn_vgg16_bn(pretrained=False, pretrained_backbone=False, vocab=mock_vocab),
+    )
+    layout_pred = layout_predictor("lw_detr_s", pretrained=False)
+    table_pred = table_predictor("tablecenternet", pretrained=False)
+
+    # A table predictor requires a layout predictor (tables are located with the layout model)
+    with pytest.raises(ValueError):
+        OCRPredictor(det_predictor, reco_predictor, table_predictor=table_pred)
+
+    doc = DocumentFile.from_pdf(mock_pdf)
+
+    # Without a table predictor -> pages carry an empty list of tables
+    predictor = OCRPredictor(det_predictor, reco_predictor)
+    assert predictor.table_predictor is None
+    out = predictor(doc)
+    assert all(page.tables == [] for page in out.pages)
+    assert all(page.export()["tables"] == [] for page in out.pages)
+
+    # With layout + table predictors -> structured tables are attached and exported
+    predictor = OCRPredictor(det_predictor, reco_predictor, layout_predictor=layout_pred, table_predictor=table_pred)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    assert isinstance(predictor.table_predictor, TablePredictor)
+    out = predictor(doc)
+    assert isinstance(out, Document)
+    for page in out.pages:
+        assert isinstance(page.tables, list)
+        assert all(isinstance(t, Table) for t in page.tables)
+        exported = page.export()
+        assert "tables" in exported
+        assert exported["tables"] == [t.export() for t in page.tables]
+
+
+def test_ocrpredictor_tables_factory():
+    # The factory exposes a single `detect_tables` flag, which also enables the layout model
+    predictor = models.ocr_predictor("db_mobilenet_v3_large", "crnn_vgg16_bn", pretrained=False, detect_tables=True)
+    assert isinstance(predictor.table_predictor, TablePredictor)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+
+    # No tables by default
+    predictor = models.ocr_predictor("db_mobilenet_v3_large", "crnn_vgg16_bn", pretrained=False)
+    assert predictor.table_predictor is None
+
+
+def test_trained_ocr_predictor(mock_pdf, mock_vocab, mock_payslip):
+    det_predictor = DetectionPredictor(
+        PreProcessor(output_size=(512, 512), batch_size=2),
+        detection.db_mobilenet_v3_large(pretrained=False, pretrained_backbone=False, assume_straight_pages=True),
+    )
+    reco_predictor = RecognitionPredictor(
+        PreProcessor(output_size=(32, 128), batch_size=32, preserve_aspect_ratio=True),
+        recognition.crnn_vgg16_bn(pretrained=False, pretrained_backbone=False, vocab=mock_vocab),
+    )
+    layout_pred = layout_predictor("lw_detr_s", pretrained=True)
+
+    doc = DocumentFile.from_pdf(mock_pdf)
+
+    # Without a layout predictor -> pages carry an empty layout
+    predictor = OCRPredictor(det_predictor, reco_predictor)
+    assert predictor.layout_predictor is None
+    out = predictor(doc)
+    assert all(page.layout == [] for page in out.pages)
+    assert all(page.export()["layout"] == [] for page in out.pages)
+
+    # With a layout predictor -> detected regions are attached to every page
+    predictor = OCRPredictor(det_predictor, reco_predictor, layout_predictor=layout_pred)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    out = predictor(doc)
+    assert isinstance(out, Document)
+    for page in out.pages:
+        assert isinstance(page.layout, list)
+        assert all(isinstance(region, LayoutElement) for region in page.layout)
+        # the layout is exported alongside the page
+        exported = page.export()
+        assert "layout" in exported
+        assert exported["layout"] == [region.export() for region in page.layout]
+
+    # Test KIE
+    predictor = KIEPredictor(det_predictor, reco_predictor, layout_predictor=layout_pred)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    out = predictor(doc)
+    assert isinstance(out, KIEDocument)
+    for page in out.pages:
+        assert isinstance(page.layout, list)
+        assert all(isinstance(region, LayoutElement) for region in page.layout)
+        assert page.export()["layout"] == [region.export() for region in page.layout]
+
+    doc = DocumentFile.from_images(mock_payslip)
+
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=True,
+        symmetric_pad=True,
+        preserve_aspect_ratio=False,
+    )
+    reco_predictor = recognition_predictor("crnn_vgg16_bn", pretrained=True, batch_size=128)
+
+    predictor = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=True,
+        straighten_pages=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+    )
+
+    out = predictor(doc)
+
+    assert out.pages[0].blocks[0].lines[0].words[0].value == "Mr."
+    geometry_mr = np.array([[0.1083984375, 0.0634765625], [0.1494140625, 0.0859375]])
+    assert np.allclose(np.array(out.pages[0].blocks[0].lines[0].words[0].geometry), geometry_mr, rtol=0.05)
+
+    assert out.pages[0].blocks[1].lines[0].words[-1].value == "revised"
+    geometry_revised = np.array([[0.7548828125, 0.126953125], [0.8388671875, 0.1484375]])
+    assert np.allclose(np.array(out.pages[0].blocks[1].lines[0].words[-1].geometry), geometry_revised, rtol=0.05)
+
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=True,
+        preserve_aspect_ratio=True,
+        symmetric_pad=True,
+    )
+
+    predictor = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=True,
+        straighten_pages=True,
+        preserve_aspect_ratio=True,
+        symmetric_pad=True,
+        resolve_blocks=True,
+        resolve_lines=True,
+    )
+    # test hooks
+    predictor.add_hook(_DummyCallback())
+
+    out = predictor(doc)
+
+    assert out.pages[0].blocks[0].lines[0].words[0].value == "Mr."
+
+
+@pytest.mark.parametrize(
+    "assume_straight_pages, straighten_pages, disable_page_orientation, disable_crop_orientation",
+    [
+        [True, False, False, False],
+        [False, False, True, True],
+        [True, True, False, False],
+        [False, True, True, True],
+        [True, False, True, False],
+    ],
+)
+def test_kiepredictor(
+    mock_pdf, mock_vocab, assume_straight_pages, straighten_pages, disable_page_orientation, disable_crop_orientation
+):
+    det_bsize = 4
+    det_predictor = DetectionPredictor(
+        PreProcessor(output_size=(512, 512), batch_size=det_bsize),
+        detection.db_mobilenet_v3_large(
+            pretrained=False,
+            pretrained_backbone=False,
+            assume_straight_pages=assume_straight_pages,
+        ),
+    )
+
+    assert not det_predictor.model.training
+
+    reco_bsize = 32
+    reco_predictor = RecognitionPredictor(
+        PreProcessor(output_size=(32, 128), batch_size=reco_bsize, preserve_aspect_ratio=True),
+        recognition.crnn_vgg16_bn(pretrained=False, pretrained_backbone=False, vocab=mock_vocab),
+    )
+
+    assert not reco_predictor.model.training
+
+    doc = DocumentFile.from_pdf(mock_pdf)
+
+    predictor = KIEPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=assume_straight_pages,
+        straighten_pages=straighten_pages,
+        detect_orientation=True,
+        detect_language=True,
+        resolve_blocks=True,
+        resolve_lines=True,
+        disable_page_orientation=disable_page_orientation,
+        disable_crop_orientation=disable_crop_orientation,
+    )
+
+    assert (
+        predictor._page_orientation_disabled if disable_page_orientation else not predictor._page_orientation_disabled
+    )
+    assert (
+        predictor._crop_orientation_disabled if disable_crop_orientation else not predictor._crop_orientation_disabled
+    )
+
+    if assume_straight_pages:
+        assert predictor.crop_orientation_predictor is None
+        if predictor.detect_orientation or predictor.straighten_pages:
+            assert isinstance(predictor.page_orientation_predictor, nn.Module)
+        else:
+            assert predictor.page_orientation_predictor is None
+    else:
+        assert isinstance(predictor.crop_orientation_predictor, nn.Module)
+        assert isinstance(predictor.page_orientation_predictor, nn.Module)
+
+    out = predictor(doc)
+    assert isinstance(out, Document)
+    assert len(out.pages) == 2
+    # Dimension check
+    with pytest.raises(ValueError):
+        input_page = (255 * np.random.rand(1, 256, 512, 3)).astype(np.uint8)
+        _ = predictor([input_page])
+
+    orientation = 0
+    assert out.pages[0].orientation["value"] == orientation
+
+    # Test with custom orientation models
+    custom_crop_orientation_model = mobilenet_v3_small_crop_orientation(pretrained=True)
+    custom_page_orientation_model = mobilenet_v3_small_page_orientation(pretrained=True)
+
+    if assume_straight_pages:
+        if predictor.detect_orientation or predictor.straighten_pages:
+            # Overwrite the default orientation models
+            predictor.crop_orientation_predictor = crop_orientation_predictor(custom_crop_orientation_model)
+            predictor.page_orientation_predictor = page_orientation_predictor(custom_page_orientation_model)
+    else:
+        # Overwrite the default orientation models
+        predictor.crop_orientation_predictor = crop_orientation_predictor(custom_crop_orientation_model)
+        predictor.page_orientation_predictor = page_orientation_predictor(custom_page_orientation_model)
+
+    out = predictor(doc)
+    orientation = 0
+    assert out.pages[0].orientation["value"] == orientation
+
+
+def test_trained_kie_predictor(mock_payslip):
+    doc = DocumentFile.from_images(mock_payslip)
+
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=True,
+        symmetric_pad=True,
+        preserve_aspect_ratio=False,
+    )
+    reco_predictor = recognition_predictor("crnn_vgg16_bn", pretrained=True, batch_size=128)
+
+    predictor = KIEPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=True,
+        straighten_pages=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+    )
+    # test hooks
+    predictor.add_hook(_DummyCallback())
+
+    out = predictor(doc)
+
+    assert isinstance(out, KIEDocument)
+    assert out.pages[0].predictions[CLASS_NAME][0].value == "Mr."
+    geometry_mr = np.array([[0.1083984375, 0.0634765625], [0.1494140625, 0.0859375]])
+    assert np.allclose(np.array(out.pages[0].predictions[CLASS_NAME][0].geometry), geometry_mr, rtol=0.05)
+
+    assert out.pages[0].predictions[CLASS_NAME][3].value == "revised"
+    geometry_revised = np.array([[0.7548828125, 0.126953125], [0.8388671875, 0.1484375]])
+    assert np.allclose(np.array(out.pages[0].predictions[CLASS_NAME][3].geometry), geometry_revised, rtol=0.05)
+
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=True,
+        preserve_aspect_ratio=True,
+        symmetric_pad=True,
+    )
+
+    predictor = KIEPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=True,
+        straighten_pages=True,
+        preserve_aspect_ratio=True,
+        symmetric_pad=True,
+        resolve_blocks=True,
+        resolve_lines=True,
+    )
+
+    out = predictor(doc)
+
+    assert isinstance(out, KIEDocument)
+    assert out.pages[0].predictions[CLASS_NAME][0].value == "Mr."
+
+
+def _test_predictor(predictor):
+    # Output checks
+    assert isinstance(predictor, OCRPredictor)
+
+    doc = [np.zeros((512, 512, 3), dtype=np.uint8)]
+    out = predictor(doc)
+    # Document
+    assert isinstance(out, Document)
+
+    # The input doc has 1 page
+    assert len(out.pages) == 1
+    # Dimension check
+    with pytest.raises(ValueError):
+        input_page = (255 * np.random.rand(1, 256, 512, 3)).astype(np.uint8)
+        _ = predictor([input_page])
+
+
+def _test_kiepredictor(predictor):
+    # Output checks
+    assert isinstance(predictor, KIEPredictor)
+
+    doc = [np.zeros((512, 512, 3), dtype=np.uint8)]
+    out = predictor(doc)
+    # Document
+    assert isinstance(out, KIEDocument)
+
+    # The input doc has 1 page
+    assert len(out.pages) == 1
+    # Dimension check
+    with pytest.raises(ValueError):
+        input_page = (255 * np.random.rand(1, 256, 512, 3)).astype(np.uint8)
+        _ = predictor([input_page])
+
+
+@pytest.mark.parametrize(
+    "det_arch, reco_arch",
+    [
+        ["db_mobilenet_v3_large", "crnn_mobilenet_v3_large"],
+    ],
+)
+def test_zoo_models(det_arch, reco_arch):
+    # Model
+    predictor = models.ocr_predictor(det_arch, reco_arch, pretrained=True)
+    _test_predictor(predictor)
+
+    # passing model instance directly
+    det_model = detection.__dict__[det_arch](pretrained=True)
+    reco_model = recognition.__dict__[reco_arch](pretrained=True)
+    predictor = models.ocr_predictor(det_model, reco_model)
+    _test_predictor(predictor)
+
+    # passing recognition model as detection model
+    with pytest.raises(ValueError):
+        models.ocr_predictor(det_arch=reco_model, pretrained=True)
+
+    # passing detection model as recognition model
+    with pytest.raises(ValueError):
+        models.ocr_predictor(reco_arch=det_model, pretrained=True)
+
+    # KIE predictor
+    predictor = models.kie_predictor(det_arch, reco_arch, pretrained=True)
+    _test_kiepredictor(predictor)
+
+    # passing model instance directly
+    det_model = detection.__dict__[det_arch](pretrained=True)
+    reco_model = recognition.__dict__[reco_arch](pretrained=True)
+    predictor = models.kie_predictor(det_model, reco_model)
+    _test_kiepredictor(predictor)
+
+    # passing recognition model as detection model
+    with pytest.raises(ValueError):
+        models.kie_predictor(det_arch=reco_model, pretrained=True)
+
+    # passing detection model as recognition model
+    with pytest.raises(ValueError):
+        models.kie_predictor(reco_arch=det_model, pretrained=True)
+
+    # Layout-aware OCR predictor via the factory (detect_layout flag)
+    predictor = models.ocr_predictor(det_arch, reco_arch, pretrained=True, detect_layout=True)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    _test_predictor(predictor)
+
+    # passing a (fine-tuned) layout model instance, like det/reco
+    layout_model = layout.lw_detr_s(pretrained=False)
+    predictor = models.ocr_predictor(det_arch, reco_arch, pretrained=True, detect_layout=True, layout_arch=layout_model)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    assert predictor.layout_predictor.model is layout_model
+
+    # disabled by default
+    predictor = models.ocr_predictor(det_arch, reco_arch, pretrained=True)
+    assert predictor.layout_predictor is None
+
+    # Layout-aware KIE predictor via the factory
+    predictor = models.kie_predictor(det_arch, reco_arch, pretrained=True, detect_layout=True)
+    assert isinstance(predictor.layout_predictor, LayoutPredictor)
+    _test_kiepredictor(predictor)
+
+
+@pytest.mark.parametrize(
+    "det_arch, reco_arch",
+    [
+        ["fast_base", "crnn_vgg16_bn"],
+    ],
+)
+def test_end_to_end_torch_compile(det_arch, reco_arch, mock_payslip):
+    doc = DocumentFile.from_images(mock_payslip)
+    predictor = models.ocr_predictor(det_arch, reco_arch, pretrained=True, assume_straight_pages=False)
+    out = predictor(doc)
+
+    assert isinstance(out, Document)
+
+    # Compile the models
+    detection_model = torch.compile(detection.__dict__[det_arch](pretrained=True).eval())
+    recognition_model = torch.compile(recognition.__dict__[reco_arch](pretrained=True).eval())
+    crop_orientation_model = torch.compile(mobilenet_v3_small_crop_orientation(pretrained=True).eval())
+    page_orientation_model = torch.compile(mobilenet_v3_small_page_orientation(pretrained=True).eval())
+
+    predictor = models.ocr_predictor(detection_model, recognition_model, assume_straight_pages=False)
+    # Set the orientation predictors
+    # NOTE: only required for non-straight pages and non-disabled orientation classification
+    predictor.crop_orientation_predictor = crop_orientation_predictor(crop_orientation_model)
+    predictor.page_orientation_predictor = page_orientation_predictor(page_orientation_model)
+    compiled_out = predictor(doc)
+
+    # Check that the number of word detections is the same
+    assert len(out.pages[0].blocks[0].lines[0].words) == len(compiled_out.pages[0].blocks[0].lines[0].words)
+    # Check that the words are the same
+    assert all(
+        word.value == compiled_out.pages[0].blocks[0].lines[0].words[i].value
+        for i, word in enumerate(out.pages[0].blocks[0].lines[0].words)
+    )
+
+
+def test_ocr_predictor_straighten_with_preserve_original_coords(mock_tilted_payslip):
+    doc = DocumentFile.from_images(mock_tilted_payslip)
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=False,
+        symmetric_pad=True,
+        preserve_aspect_ratio=False,
+    )
+    reco_predictor = recognition_predictor("crnn_vgg16_bn", pretrained=True, batch_size=128)
+    predictor_on = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=False,
+        straighten_pages=True,
+        detect_orientation=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+        preserve_original_coords=True,
+    )
+    predictor_off = OCRPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=False,
+        straighten_pages=True,
+        detect_orientation=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+        preserve_original_coords=False,
+    )
+    out_on = predictor_on(doc)
+    out_off = predictor_off(doc)
+    assert len(out_on.pages[0].blocks) > 0
+    assert len(out_off.pages[0].blocks) > 0
+    geoms_on = [
+        np.array(w.geometry).reshape(-1, 2).tolist()
+        for block in out_on.pages[0].blocks
+        for line in block.lines
+        for w in line.words
+    ]
+    geoms_off = [
+        np.array(w.geometry).reshape(-1, 2).tolist()
+        for block in out_off.pages[0].blocks
+        for line in block.lines
+        for w in line.words
+    ]
+    assert geoms_on != geoms_off
+    assert any(w.value == "Mr." for block in out_on.pages[0].blocks for line in block.lines for w in line.words)
+    assert out_on.pages[0].page.shape[:2] == out_on.pages[0].dimensions
+    assert out_on.pages[0].page.shape[:2] == doc[0].shape[:2]
+
+
+def test_kie_predictor_straighten_with_preserve_original_coords(mock_tilted_payslip):
+    doc = DocumentFile.from_images(mock_tilted_payslip)
+    det_predictor = detection_predictor(
+        "fast_base",
+        pretrained=True,
+        batch_size=2,
+        assume_straight_pages=False,
+        symmetric_pad=True,
+        preserve_aspect_ratio=False,
+    )
+    reco_predictor = recognition_predictor("crnn_vgg16_bn", pretrained=True, batch_size=128)
+    predictor_on = KIEPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=False,
+        straighten_pages=True,
+        detect_orientation=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+        preserve_original_coords=True,
+    )
+    predictor_off = KIEPredictor(
+        det_predictor,
+        reco_predictor,
+        assume_straight_pages=False,
+        straighten_pages=True,
+        detect_orientation=True,
+        preserve_aspect_ratio=False,
+        resolve_blocks=True,
+        resolve_lines=True,
+        preserve_original_coords=False,
+    )
+    out_on = predictor_on(doc)
+    out_off = predictor_off(doc)
+    assert len(out_on.pages[0].predictions[CLASS_NAME]) > 0
+    assert len(out_off.pages[0].predictions[CLASS_NAME]) > 0
+    geoms_on = [np.array(p.geometry).reshape(-1, 2).tolist() for p in out_on.pages[0].predictions[CLASS_NAME]]
+    geoms_off = [np.array(p.geometry).reshape(-1, 2).tolist() for p in out_off.pages[0].predictions[CLASS_NAME]]
+    assert geoms_on != geoms_off
+    assert out_on.pages[0].page.shape[:2] == out_on.pages[0].dimensions
+    assert out_on.pages[0].page.shape[:2] == doc[0].shape[:2]
